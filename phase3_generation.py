@@ -100,8 +100,8 @@ DIFFICULTY_INSTRUCTIONS = {
     "advanced":     "40-100 lines, non-trivial patterns, may use unsafe or advanced idioms.",
 }
 
-CODE_PROMPT = """\
-Generate a paired C and Rust code snippet that implements the following:
+C_CODE_PROMPT = """\
+Generate a C code snippet that implements the following:
 
   Concept   : {description}
   Category  : {category_name}
@@ -109,31 +109,52 @@ Generate a paired C and Rust code snippet that implements the following:
 
 Rules:
 - The C snippet must compile cleanly with: gcc -Wall -Werror -std=c11
-- The Rust snippet must compile cleanly with: cargo check (edition 2021)
-- The pair must be semantically equivalent (same logic, same observable behaviour)
-- Include all necessary #include headers or use statements
+- Include all necessary #include headers
 - Do NOT wrap in main() unless the concept specifically requires program entry
 - Do NOT add a WinMain() function
 
 Respond with a single JSON object ONLY. No markdown, no code fences, no explanation.
 The object must have exactly these keys:
-  "id"          : "{idea_id}"
-  "category"    : "{category_slug}"
-  "difficulty"  : "{difficulty}"
-  "description" : "{description}"
-  "c_code"      : the complete C snippet as a string
-  "rust_code"   : the complete Rust snippet as a string
+  "c_code" : the complete C snippet as a string
+"""
+
+RUST_TRANSLATE_PROMPT = """\
+Translate the following C code snippet into Rust. The Rust snippet must be semantically equivalent (same logic, same observable behaviour).
+
+  Concept   : {description}
+  Category  : {category_name}
+  Difficulty: {difficulty} -- {difficulty_instruction}
+
+C Code:
+{c_code}
+
+Rules:
+- The Rust snippet must compile cleanly with: cargo check (edition 2021)
+- Include all necessary use statements
+- Do NOT wrap in main() unless the C code has a main() function
+- Do NOT add a WinMain() function
+
+Respond with a single JSON object ONLY. No markdown, no code fences, no explanation.
+The object must have exactly these keys:
+  "rust_code" : the complete Rust snippet as a string
 """
 
 
-def render_prompt(idea: sqlite3.Row) -> str:
-    return CODE_PROMPT.format(
+def render_c_prompt(idea: sqlite3.Row) -> str:
+    return C_CODE_PROMPT.format(
         description=idea["description"],
         category_name=idea["category"].replace("_", " ").title(),
-        category_slug=idea["category"],
         difficulty=idea["difficulty"],
         difficulty_instruction=DIFFICULTY_INSTRUCTIONS[idea["difficulty"]],
-        idea_id=idea["id"],
+    )
+
+def render_rust_prompt(idea: sqlite3.Row, c_code: str) -> str:
+    return RUST_TRANSLATE_PROMPT.format(
+        description=idea["description"],
+        category_name=idea["category"].replace("_", " ").title(),
+        difficulty=idea["difficulty"],
+        difficulty_instruction=DIFFICULTY_INSTRUCTIONS[idea["difficulty"]],
+        c_code=c_code,
     )
 
 
@@ -169,7 +190,7 @@ def _parse_object(raw: str) -> dict:
 
 # ── Ollama call ───────────────────────────────────────────────────────────────
 
-def call_ollama(prompt: str, context_id: str = "") -> dict:
+def call_ollama_json(prompt: str, context_id: str, required_keys: set) -> dict:
     raw_text = llm_chat_logged(
         phase="3_generation",
         context_id=context_id,
@@ -183,8 +204,7 @@ def call_ollama(prompt: str, context_id: str = "") -> dict:
     if not isinstance(obj, dict):
         raise ValueError(f"Expected JSON object, got {type(obj).__name__}")
 
-    required = {"id", "category", "difficulty", "description", "c_code", "rust_code"}
-    missing  = required - obj.keys()
+    missing  = required_keys - obj.keys()
     if missing:
         raise ValueError(f"Response missing keys: {missing}")
 
@@ -198,22 +218,39 @@ def generate_code_for_idea(conn: sqlite3.Connection, idea: sqlite3.Row) -> bool:
     Generate C/Rust code for one idea. Returns True if successfully inserted.
     Marks the idea as 'code_generated' or 'failed' in the ideas table.
     """
-    prompt     = render_prompt(idea)
-    snippet    = None
+    c_prompt   = render_c_prompt(idea)
+    c_snippet  = None
+    rust_snippet = None
     last_error = None
 
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            snippet = call_ollama(prompt, context_id=idea["id"])
+            c_snippet = call_ollama_json(c_prompt, context_id=idea["id"], required_keys={"c_code"})
             break
         except Exception as e:
             last_error = str(e)
-            log.warning(f"  Attempt {attempt}/{MAX_RETRIES} failed: {e}")
+            log.warning(f"  Attempt {attempt}/{MAX_RETRIES} failed for C: {e}")
             if attempt < MAX_RETRIES:
                 time.sleep(RETRY_DELAY * attempt)
 
-    if snippet is None:
-        log.warning(f"  Code generation failed for idea {idea['id']}: {last_error}")
+    if c_snippet is None:
+        log.warning(f"  C Code generation failed for idea {idea['id']}: {last_error}")
+        mark_idea(conn, idea["id"], "failed")
+        return False
+
+    rust_prompt = render_rust_prompt(idea, c_snippet["c_code"])
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            rust_snippet = call_ollama_json(rust_prompt, context_id=idea["id"], required_keys={"rust_code"})
+            break
+        except Exception as e:
+            last_error = str(e)
+            log.warning(f"  Attempt {attempt}/{MAX_RETRIES} failed for Rust: {e}")
+            if attempt < MAX_RETRIES:
+                time.sleep(RETRY_DELAY * attempt)
+
+    if rust_snippet is None:
+        log.warning(f"  Rust Code generation failed for idea {idea['id']}: {last_error}")
         mark_idea(conn, idea["id"], "failed")
         return False
 
@@ -225,9 +262,9 @@ def generate_code_for_idea(conn: sqlite3.Connection, idea: sqlite3.Row) -> bool:
             "INSERT OR IGNORE INTO raw_snippets "
             "(id, category, difficulty, description, c_code, rust_code, idea_id) "
             "VALUES (?,?,?,?,?,?,?)",
-            (sid, snippet["category"], snippet["difficulty"],
-             snippet.get("description", idea["description"]),
-             snippet["c_code"], snippet["rust_code"], idea["id"]),
+            (sid, idea["category"], idea["difficulty"],
+             idea["description"],
+             c_snippet["c_code"], rust_snippet["rust_code"], idea["id"]),
         )
         inserted = conn.execute("SELECT changes()").fetchone()[0]
     except sqlite3.Error as e:

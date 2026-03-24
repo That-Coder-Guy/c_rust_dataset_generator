@@ -4,8 +4,8 @@ Generates 5,000 unique snippet concept descriptions BEFORE any code is written.
 Uniqueness is enforced via cosine similarity on the embedding model so that
 every idea in the dataset is semantically distinct.
 
-Each idea is a single sentence describing exactly what a C/Rust snippet pair
-should demonstrate. These ideas are stored in the `ideas` table and consumed
+Each idea names a concept that suits C and also admits a clear Rust
+implementation (idiomatic, mostly safe). Ideas are stored in the `ideas` table and consumed
 by phase 2b which generates the actual code.
 
 Outputs:
@@ -144,9 +144,11 @@ DIFFICULTY_INSTRUCTIONS = {
 }
 
 IDEA_PROMPT = """\
-You are curating a dataset of C and Rust code snippet pairs.
+You are curating a dataset of paired C and Rust code snippets. Name concepts that are
+natural to implement in C and that can also be written cleanly in Rust (idiomatic where
+possible; avoid ideas that would only translate as wall-to-wall unsafe Rust).
 
-Generate ONE unique idea for a paired C/Rust code snippet in this category:
+Generate ONE unique idea for such a pair in this category:
   Category   : {category_name}
   Description: {category_description}
   Difficulty : {difficulty} ({difficulty_instruction})
@@ -158,7 +160,7 @@ Rules:
 - Respond with a SINGLE noun phrase (max 20 words) naming the concept the snippet demonstrates
 - Start with "A", "An", or "The" -- never start with a verb or gerund (e.g. NOT "Implementing...", NOT "Using...")
 - Be specific -- name the function, pattern, or concept (e.g. "A bounded string copy using strncpy with a fixed-size destination buffer")
-- Do NOT include the words "C" or "Rust" in your response
+- Do NOT generate ideas that require external network access, file system I/O, or interactive user input
 - No explanation, no preamble, no punctuation at the end beyond a period
 - Return the noun phrase only
 """

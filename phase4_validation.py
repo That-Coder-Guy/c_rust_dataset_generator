@@ -445,6 +445,136 @@ def check_semantic_equivalence(c_code: str, rust_code: str, context_id: str = ""
         return True, "check skipped (error)"
 
 
+def _extract_json_object(text: str) -> str:
+    text = text.strip()
+    if "```" in text:
+        parts = text.split("```")
+        candidates = [p.lstrip("json").strip() for p in parts[1::2]]
+        text = max(candidates, key=len) if candidates else text
+    start = text.find("{")
+    end   = text.rfind("}")
+    if start != -1 and end > start:
+        text = text[start : end + 1]
+    return text.strip()
+
+def _parse_object(raw: str) -> dict:
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        pass
+    try:
+        from json_repair import repair_json
+        result = json.loads(repair_json(raw))
+        if isinstance(result, dict):
+            return result
+    except Exception:
+        pass
+    raise ValueError("Could not parse a valid JSON object from model response")
+
+DYNAMIC_TEST_PROMPT = """\
+You are an expert test engineer.
+I have a C code snippet and a Rust code snippet that are supposed to be equivalent.
+Please write a `main()` function for each that tests the logic with 2-3 standard test cases and prints the outputs to stdout.
+
+C snippet:
+{c_code}
+
+Rust snippet:
+{rust_code}
+
+Return a JSON object ONLY with the following keys:
+- "c_main": the complete C code containing the test main function (including the original snippet and any needed headers)
+- "rust_main": the complete Rust code containing the test main function (including the original snippet and any needed use statements)
+
+Rules:
+- The printed outputs must match EXACTLY between C and Rust for the same test cases.
+- Do not use random numbers, time-based values, or user input.
+- Both programs must exit with code 0 on success.
+- Do not output any markdown.
+"""
+
+def check_dynamic_equivalence(c_code: str, rust_code: str, context_id: str = "") -> tuple[bool, str]:
+    prompt = DYNAMIC_TEST_PROMPT.format(c_code=c_code, rust_code=rust_code)
+    try:
+        raw_text = llm_chat_logged(
+            phase="4_dynamic_test",
+            context_id=context_id,
+            prompt=prompt,
+            temperature=0.2,
+            max_tokens=4096,
+        )
+        raw = _extract_json_object(raw_text)
+        test_obj = _parse_object(raw)
+        if "c_main" not in test_obj or "rust_main" not in test_obj:
+            raise ValueError("Missing keys in JSON")
+    except Exception as e:
+        log.warning(f"  Dynamic test generation failed: {e}. Falling back to semantic check.")
+        return check_semantic_equivalence(c_code, rust_code, context_id)
+
+    import tempfile, os, subprocess
+    c_out = ""
+    with tempfile.NamedTemporaryFile(suffix=".c", delete=False) as tmp_c:
+        tmp_c.write(test_obj["c_main"].encode("utf-8"))
+        c_src = tmp_c.name
+    c_exe = c_src + (".exe" if os.name == "nt" else ".out")
+    
+    try:
+        gcc_res = subprocess.run(["gcc", "-Wall", "-std=c11", "-x", "c", c_src, "-o", c_exe], capture_output=True, text=True, timeout=10)
+        if gcc_res.returncode != 0:
+            log.warning("  Dynamic test C compile failed. Falling back to semantic check.")
+            return check_semantic_equivalence(c_code, rust_code, context_id)
+        run_res = subprocess.run([c_exe], capture_output=True, text=True, timeout=5)
+        if run_res.returncode != 0:
+            log.warning("  Dynamic test C run failed. Falling back to semantic check.")
+            return check_semantic_equivalence(c_code, rust_code, context_id)
+        c_out = run_res.stdout.strip()
+    except subprocess.TimeoutExpired:
+        log.warning("  Dynamic test C timeout. Falling back to semantic check.")
+        return check_semantic_equivalence(c_code, rust_code, context_id)
+    except Exception as e:
+        log.warning(f"  Dynamic test C error: {e}. Falling back to semantic check.")
+        return check_semantic_equivalence(c_code, rust_code, context_id)
+    finally:
+        for f in [c_src, c_exe]:
+            try: os.unlink(f)
+            except: pass
+
+    rust_out = ""
+    with tempfile.NamedTemporaryFile(suffix=".rs", delete=False) as tmp_r:
+        tmp_r.write(test_obj["rust_main"].encode("utf-8"))
+        r_src = tmp_r.name
+    r_exe = r_src + (".exe" if os.name == "nt" else ".out")
+    
+    try:
+        rustc_res = subprocess.run(["rustc", "--edition", "2021", r_src, "-o", r_exe], capture_output=True, text=True, timeout=15)
+        if rustc_res.returncode != 0:
+            log.warning("  Dynamic test Rust compile failed. Falling back to semantic check.")
+            return check_semantic_equivalence(c_code, rust_code, context_id)
+        run_res = subprocess.run([r_exe], capture_output=True, text=True, timeout=5)
+        if run_res.returncode != 0:
+            log.warning("  Dynamic test Rust run failed. Falling back to semantic check.")
+            return check_semantic_equivalence(c_code, rust_code, context_id)
+        rust_out = run_res.stdout.strip()
+    except subprocess.TimeoutExpired:
+        log.warning("  Dynamic test Rust timeout. Falling back to semantic check.")
+        return check_semantic_equivalence(c_code, rust_code, context_id)
+    except Exception as e:
+        log.warning(f"  Dynamic test Rust error: {e}. Falling back to semantic check.")
+        return check_semantic_equivalence(c_code, rust_code, context_id)
+    finally:
+        for f in [r_src, r_exe]:
+            try: os.unlink(f)
+            except: pass
+
+    if c_out == rust_out and c_out != "":
+        return True, "dynamic execution matched"
+    elif c_out == rust_out and c_out == "":
+        log.warning("  Dynamic test matched but output was empty. Falling back to semantic check.")
+        return check_semantic_equivalence(c_code, rust_code, context_id)
+    else:
+        return False, f"dynamic output mismatch (C: {c_out[:20]!r}, Rust: {rust_out[:20]!r})"
+
+
 # ── Lint helpers (non-blocking) ───────────────────────────────────────────────
 
 def cppcheck_lite(c_code: str) -> list[str]:
@@ -468,6 +598,62 @@ def clippy_lite(rust_code: str) -> list[str]:
         if pat in rust_code:
             warnings.append(f"uses {pat}")
     return warnings
+
+
+def run_cppcheck(c_code: str) -> list[str]:
+    if not _tool_available("cppcheck"):
+        return cppcheck_lite(c_code)
+    import tempfile, os
+    with tempfile.NamedTemporaryFile(suffix=".c", delete=False) as tmp:
+        tmp.write(c_code.encode("utf-8"))
+        tmp_path = tmp.name
+    try:
+        result = subprocess.run(
+            ["cppcheck", "--enable=warning,performance,style", "--template={message}", tmp_path],
+            capture_output=True, text=True, timeout=10
+        )
+        warnings = [line.strip() for line in result.stderr.splitlines() if line.strip() and not line.startswith("Checking ") and not line.startswith("nofile:")]
+        return warnings
+    except Exception as e:
+        return [f"cppcheck error: {e}"]
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
+_CLIPPY_DIR = None
+
+def get_clippy_dir():
+    global _CLIPPY_DIR
+    if _CLIPPY_DIR is None:
+        import tempfile, os
+        _CLIPPY_DIR = tempfile.mkdtemp()
+        subprocess.run(["cargo", "init", "--lib", _CLIPPY_DIR], capture_output=True)
+    return _CLIPPY_DIR
+
+def run_clippy(rust_code: str) -> list[str]:
+    if not _tool_available("cargo"):
+        return clippy_lite(rust_code)
+    import os
+    d = get_clippy_dir()
+    lib_rs = os.path.join(d, "src", "lib.rs")
+    with open(lib_rs, "w", encoding="utf-8") as f:
+        preamble = "#![allow(dead_code, unused_variables, unused_imports)]\n"
+        f.write(preamble + rust_code)
+    try:
+        result = subprocess.run(
+            ["cargo", "clippy", "--message-format=short"],
+            cwd=d, capture_output=True, text=True, timeout=20
+        )
+        warnings = []
+        for line in result.stderr.splitlines() + result.stdout.splitlines():
+            if "warning:" in line:
+                warnings.append(line.split("warning:", 1)[1].strip())
+        return warnings
+    except Exception as e:
+        return [f"clippy error: {e}"]
 
 
 # ── Main validation loop ──────────────────────────────────────────────────────
@@ -539,13 +725,13 @@ def validate_all(conn: sqlite3.Connection, econn: sqlite3.Connection) -> dict:
                     reason = f"rust_compile_fail: {rust_err[:120]}"
                     stats["rust_compile_fail"] += 1
                 else:
-                    # 4. Semantic equivalence (use final corrected code)
-                    is_equiv, note = check_semantic_equivalence(c_code, rust_code, context_id=sid)
+                    # 4. Semantic and Dynamic equivalence (use final corrected code)
+                    is_equiv, note = check_dynamic_equivalence(c_code, rust_code, context_id=sid)
                     if not is_equiv:
                         reason = f"not_equivalent: {note}"
                         stats["not_equivalent"] += 1
 
-        lint = "; ".join(cppcheck_lite(c_code) + clippy_lite(rust_code)) or None
+        lint = "; ".join(run_cppcheck(c_code) + run_clippy(rust_code)) or None
         new_status = "rejected" if reason else "validated"
         if new_status == "validated":
             stats["validated"] += 1
