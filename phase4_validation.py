@@ -29,7 +29,7 @@ import subprocess
 from pathlib import Path
 
 import numpy as np
-from chat_logger import llm_chat_logged, embed_logged, code_embed_logged
+from chat_logger import llm_chat_logged, embed_logged, code_embed_logged, code_embed_logged
 
 # ── Config ────────────────────────────────────────────────────────────────────
 

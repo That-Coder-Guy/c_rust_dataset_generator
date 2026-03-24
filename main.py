@@ -38,8 +38,11 @@ MAIN_LOG      = OUTPUT_DIR / "main.log"
 
 import os as _os
 from pathlib import Path as _Path
-DEFAULT_LLM_MODEL_PATH   = _os.environ.get("LLM_MODEL_PATH",   str(_MODELS / "qwen2.5-coder-32b.gguf"))
-DEFAULT_EMBED_MODEL_PATH = _os.environ.get("EMBED_MODEL_PATH", str(_MODELS / "nomic-embed-text.gguf"))
+_SCRIPT_DIR = _Path(__file__).parent
+_MODELS     = _SCRIPT_DIR / "models"
+DEFAULT_LLM_MODEL_PATH        = _os.environ.get("LLM_MODEL_PATH",        str(_MODELS / "qwen3-coder-30b.gguf"))
+DEFAULT_EMBED_MODEL_PATH      = _os.environ.get("EMBED_MODEL_PATH",      str(_MODELS / "nomic-embed-text.gguf"))
+DEFAULT_CODE_EMBED_MODEL_PATH = _os.environ.get("CODE_EMBED_MODEL_PATH", str(_MODELS / "Qwen3-Embedding-8B-Q4_K_M.gguf"))
 
 
 # -- Logging -------------------------------------------------------------------
@@ -85,6 +88,34 @@ def save_state(state: dict):
 
 # -- Pre-flight ----------------------------------------------------------------
 
+def check_gpu() -> tuple[bool, str]:
+    """Check for CUDA GPU via nvidia-smi. Safe to call on login nodes."""
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name,memory.total,memory.free,driver_version",
+             "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode != 0:
+            return False, "nvidia-smi failed -- no GPU visible on this node"
+        lines = [l.strip() for l in result.stdout.strip().splitlines() if l.strip()]
+        if not lines:
+            return False, "nvidia-smi returned no GPU info"
+        summaries = []
+        for line in lines:
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) >= 3:
+                summaries.append(f"{parts[0]}  |  total: {parts[1]}  |  free: {parts[2]}")
+            else:
+                summaries.append(line)
+        return True, "\n  ".join(summaries)
+    except FileNotFoundError:
+        return False, "nvidia-smi not found -- no GPU driver on this node"
+    except subprocess.TimeoutExpired:
+        return False, "nvidia-smi timed out"
+
+
 def preflight_checks(llm_model_path: str, embed_model_path: str) -> bool:
     ok = True
 
@@ -99,9 +130,19 @@ def preflight_checks(llm_model_path: str, embed_model_path: str) -> bool:
     if not ok:
         return False
 
+    # GPU check
+    gpu_available, gpu_info = check_gpu()
+    if gpu_available:
+        log.info(f"  GPU: {gpu_info}")
+    else:
+        log.error(f"  GPU: {gpu_info}")
+        log.error("  Inference requires a GPU. Use --check-resources on login nodes.")
+        ok = False
+
     # Check model files exist
     from pathlib import Path as _Path
-    for label, path in [("LLM", llm_model_path), ("Embed", embed_model_path)]:
+    code_embed_path = _os.environ.get("CODE_EMBED_MODEL_PATH", "")
+    for label, path in [("LLM", llm_model_path), ("NLP embed", embed_model_path), ("Code embed", code_embed_path)]:
         if _Path(path).exists():
             size_gb = _Path(path).stat().st_size / 1e9
             log.info(f"  {label} model: {path} ({size_gb:.1f} GB)")
@@ -243,6 +284,10 @@ def main():
                         help="Path to embedding GGUF file")
     parser.add_argument("--log-level", type=str,  default="INFO",
                         choices=["DEBUG", "INFO", "WARNING"])
+    parser.add_argument("--check-resources", action="store_true",
+                        help="Check GPU, models, and tools then exit -- safe on login node")
+    parser.add_argument("--code-embed", type=str, default=DEFAULT_CODE_EMBED_MODEL_PATH,
+                        help="Path to code embedding GGUF file")
     args = parser.parse_args()
 
     setup_logging(args.log_level)
@@ -258,8 +303,45 @@ def main():
 
     # Set env vars so llm_backend.py picks up the right model paths
     import os as _os
-    _os.environ["LLM_MODEL_PATH"]   = args.llm
-    _os.environ["EMBED_MODEL_PATH"] = args.embed
+    _os.environ["LLM_MODEL_PATH"]        = args.llm
+    _os.environ["EMBED_MODEL_PATH"]      = args.embed
+    _os.environ["CODE_EMBED_MODEL_PATH"] = args.code_embed
+
+    if args.check_resources:
+        log.info("Resource check (no inference will run)")
+        print()
+        gpu_ok, gpu_info = check_gpu()
+        print(f"  {'[OK]' if gpu_ok else '[!!]'} GPU")
+        for line in gpu_info.splitlines():
+            print(f"       {line}")
+        print()
+        from llm_backend import CODE_EMBED_MODEL_PATH
+        def _fmt(gb):
+            return f"{gb/1000:.1f} TB" if gb >= 1000 else f"{gb:.0f} GB"
+        for label, path in [("LLM", args.llm), ("NLP embed", args.embed), ("Code embed", CODE_EMBED_MODEL_PATH)]:
+            p = Path(path)
+            if p.exists():
+                print(f"  [OK] {label:<12} {_fmt(p.stat().st_size/1e9)}   {path}")
+            else:
+                print(f"  [!!] {label:<12} NOT FOUND   {path}")
+        print()
+        import shutil as _sh
+        usage = _sh.disk_usage(Path(__file__).parent)
+        free_gb, total_gb = usage.free/1e9, usage.total/1e9
+        print(f"  {'[OK]' if free_gb > 50 else '[!!]'} Disk  {_fmt(free_gb)} free of {_fmt(total_gb)}")
+        print()
+        for tool in ["gcc", "rustc"]:
+            print(f"  {'[OK]' if _sh.which(tool) else '[--]'} {tool}")
+        print()
+        for pkg in ["llama_cpp", "numpy", "json_repair"]:
+            try:
+                __import__(pkg); print(f"  [OK] {pkg}")
+            except ImportError:
+                print(f"  [!!] {pkg}  (pip install {pkg.replace('_','-')})")
+        print()
+        print("  No GPU -- submit via SLURM to run." if not gpu_ok else "  All checks passed -- ready to run.")
+        print()
+        sys.exit(0)
 
     if not preflight_checks(args.llm, args.embed):
         sys.exit(1)
@@ -366,6 +448,15 @@ def main():
         for p in [3, 4]:
             if p not in state["phases_completed"]:
                 state["phases_completed"].append(p)
+        save_state(state)
+
+    # -- Phase 5: export -----------------------------------------------
+    if 5 in phases_to_run:
+        t0 = time.time()
+        run_phase5()
+        if 5 not in state["phases_completed"]:
+            state["phases_completed"].append(5)
+        state["phase5_duration_s"] = round(time.time() - t0, 1)
         save_state(state)
 
     # -- Final summary -------------------------------------------------------

@@ -86,9 +86,12 @@ def llm_chat_logged(
 
 
 def embed_logged(text: str, context_id: str = "") -> list[float]:
-    """
-    Get an embedding via llm_backend.embed().
-    Lightweight -- not logged to the chat history (too noisy).
-    """
+    """NLP embedding (nomic-embed-text) -- used for idea deduplication in phase 2."""
     from llm_backend import embed
     return embed(text)
+
+
+def code_embed_logged(text: str, context_id: str = "") -> list[float]:
+    """Code embedding (Qwen3-Embedding-8B) -- used for snippet deduplication in phase 4."""
+    from llm_backend import code_embed
+    return code_embed(text)
