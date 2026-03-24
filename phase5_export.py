@@ -14,7 +14,7 @@ import csv
 import json
 import os
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -106,7 +106,7 @@ def export_huggingface(rows: list[sqlite3.Row], out_dir: Path):
         "dataset_name": "c_rust_snippet_pairs",
         "description": "5,000 paired C and Rust code snippets with semantic equivalence validation.",
         "version": "1.0.0",
-        "created_at": datetime.utcnow().isoformat() + "Z",
+        "created_at": datetime.now(timezone.utc).isoformat(),
         "total_examples": len(rows),
         "splits": {
             "train": len(train_rows),
@@ -197,7 +197,7 @@ def write_summary(rows: list[sqlite3.Row], paths: dict):
             cat_diff[row["category"]].get(row["difficulty"], 0) + 1
 
     summary = {
-        "exported_at": datetime.utcnow().isoformat() + "Z",
+        "exported_at": datetime.now(timezone.utc).isoformat(),
         "total_validated_pairs": len(rows),
         "output_files": {k: str(v) for k, v in paths.items()},
         "by_category_and_difficulty": cat_diff,

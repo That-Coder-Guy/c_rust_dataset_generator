@@ -38,7 +38,6 @@ MAIN_LOG      = OUTPUT_DIR / "main.log"
 
 import os as _os
 from pathlib import Path as _Path
-_MODELS = _Path.home() / "c_rust_dataset" / "models"
 DEFAULT_LLM_MODEL_PATH   = _os.environ.get("LLM_MODEL_PATH",   str(_MODELS / "qwen2.5-coder-32b.gguf"))
 DEFAULT_EMBED_MODEL_PATH = _os.environ.get("EMBED_MODEL_PATH", str(_MODELS / "nomic-embed-text.gguf"))
 
@@ -86,43 +85,6 @@ def save_state(state: dict):
 
 # -- Pre-flight ----------------------------------------------------------------
 
-def check_gpu() -> tuple[bool, str]:
-    """
-    Check whether a CUDA GPU is available and return (available, summary_string).
-    Uses subprocess to call nvidia-smi -- no CUDA libraries need to be loaded.
-    Works on the login node as a lightweight resource check.
-    """
-    import subprocess
-    try:
-        result = subprocess.run(
-            ["nvidia-smi",
-             "--query-gpu=name,memory.total,memory.free,driver_version",
-             "--format=csv,noheader"],
-            capture_output=True, text=True, timeout=10,
-        )
-        if result.returncode != 0:
-            return False, "nvidia-smi failed -- no GPU visible on this node"
-
-        lines = [l.strip() for l in result.stdout.strip().splitlines() if l.strip()]
-        if not lines:
-            return False, "nvidia-smi returned no GPU info"
-
-        summaries = []
-        for line in lines:
-            parts = [p.strip() for p in line.split(",")]
-            if len(parts) >= 3:
-                name, total, free = parts[0], parts[1], parts[2]
-                summaries.append(f"{name}  |  total: {total}  |  free: {free}")
-            else:
-                summaries.append(line)
-        return True, "\n  ".join(summaries)
-
-    except FileNotFoundError:
-        return False, "nvidia-smi not found -- no GPU driver on this node"
-    except subprocess.TimeoutExpired:
-        return False, "nvidia-smi timed out"
-
-
 def preflight_checks(llm_model_path: str, embed_model_path: str) -> bool:
     ok = True
 
@@ -136,16 +98,6 @@ def preflight_checks(llm_model_path: str, embed_model_path: str) -> bool:
 
     if not ok:
         return False
-
-    # GPU check -- inference phases require a CUDA GPU
-    gpu_available, gpu_info = check_gpu()
-    if gpu_available:
-        log.info(f"  GPU: {gpu_info}")
-    else:
-        log.error(f"  GPU: {gpu_info}")
-        log.error("  Inference phases (2-4) require a GPU. Run on a compute node.")
-        log.error("  Use --check-resources to verify setup without running inference.")
-        ok = False
 
     # Check model files exist
     from pathlib import Path as _Path
@@ -246,26 +198,32 @@ def run_phase3(llm_model: str):
     log.info("--- Phase 3: Generating code from ideas ---")
     import phase3_generation as p3
     p3.main()
-    log.info("Phase 5 complete [OK]")
+    log.info("Phase 3 complete [OK]")
 
 
 def run_phase4(llm_model: str, embed_model: str):
     log.info("--- Phase 4: Validating and deduplicating ---")
-    import phase4_validation as p3
-    p3.main()
-    log.info("Phase 5 complete [OK]")
+    import phase4_validation as p4
+    p4.main()
+    log.info("Phase 4 complete [OK]")
 
 
 def run_phase5():
     log.info("--- Phase 5: Exporting dataset ---")
-    import phase5_export as p4
-    p4.main()
+    import phase5_export as p5
+    p5.main()
     log.info("Phase 5 complete [OK]")
 
 
 # -- Main ----------------------------------------------------------------------
 
 def main():
+    # Change to the directory containing main.py so all relative paths
+    # in every phase file resolve correctly regardless of where the script
+    # is invoked from (e.g. sbatch from home dir, or python from elsewhere).
+    import os
+    os.chdir(Path(__file__).parent)
+
     parser = argparse.ArgumentParser(
         description="Generate 5,000 paired C/Rust code snippets using llama-cpp-python."
     )
@@ -285,8 +243,6 @@ def main():
                         help="Path to embedding GGUF file")
     parser.add_argument("--log-level", type=str,  default="INFO",
                         choices=["DEBUG", "INFO", "WARNING"])
-    parser.add_argument("--check-resources", action="store_true",
-                        help="Check GPU, models, and tools then exit -- safe to run on login node")
     args = parser.parse_args()
 
     setup_logging(args.log_level)
@@ -304,69 +260,6 @@ def main():
     import os as _os
     _os.environ["LLM_MODEL_PATH"]   = args.llm
     _os.environ["EMBED_MODEL_PATH"] = args.embed
-
-    # --check-resources: lightweight check safe to run on the login node.
-    # Reports GPU, model files, disk space, and tools then exits without
-    # loading any models or making any inference calls.
-    if args.check_resources:
-        log.info("Resource check (no inference will run)")
-        print()
-
-        # GPU
-        gpu_ok, gpu_info = check_gpu()
-        icon = "[OK]" if gpu_ok else "[!!]"
-        print(f"  {icon} GPU")
-        for line in gpu_info.splitlines():
-            print(f"       {line}")
-
-        # Models
-        print()
-        from llm_backend import CODE_EMBED_MODEL_PATH
-        models = [
-            ("LLM",        args.llm),
-            ("NLP embed",  args.embed),
-            ("Code embed", CODE_EMBED_MODEL_PATH),
-        ]
-        for label, path in models:
-            p = Path(path)
-            if p.exists():
-                size_gb = p.stat().st_size / 1e9
-                print(f"  [OK] {label:<12} {size_gb:.1f} GB   {path}")
-            else:
-                print(f"  [!!] {label:<12} NOT FOUND   {path}")
-
-        # Disk space
-        print()
-        import shutil as _shutil
-        usage = _shutil.disk_usage(Path.home())
-        free_gb  = usage.free  / 1e9
-        total_gb = usage.total / 1e9
-        icon = "[OK]" if free_gb > 50 else "[!!]"
-        print(f"  {icon} Disk  {free_gb:.0f} GB free of {total_gb:.0f} GB")
-
-        # Compile tools
-        print()
-        for tool in ["gcc", "rustc"]:
-            found = _shutil.which(tool) is not None
-            icon  = "[OK]" if found else "[--]"
-            print(f"  {icon} {tool}")
-
-        # Python packages
-        print()
-        for pkg in ["llama_cpp", "numpy", "json_repair"]:
-            try:
-                __import__(pkg)
-                print(f"  [OK] {pkg}")
-            except ImportError:
-                print(f"  [!!] {pkg}  (pip install {pkg.replace('_', '-')})")
-
-        print()
-        if not gpu_ok:
-            print("  No GPU on this node -- submit via SLURM to a GPU partition to run.")
-        else:
-            print("  All checks passed -- ready to run.")
-        print()
-        sys.exit(0)
 
     if not preflight_checks(args.llm, args.embed):
         sys.exit(1)
@@ -473,14 +366,6 @@ def main():
         for p in [3, 4]:
             if p not in state["phases_completed"]:
                 state["phases_completed"].append(p)
-        save_state(state)
-
-    # -- Phase 4 ------------------------------------------------------------
-    if 4 in phases_to_run:
-        t0 = time.time()
-        run_phase4()
-        state["phases_completed"].append(4)
-        state["phase4_duration_s"] = round(time.time() - t0, 1)
         save_state(state)
 
     # -- Final summary -------------------------------------------------------

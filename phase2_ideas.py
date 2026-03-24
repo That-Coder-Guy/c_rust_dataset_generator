@@ -14,8 +14,7 @@ Outputs:
 
 Requirements:
   pip install ollama numpy
-  ollama pull <LLM_MODEL>
-  ollama pull <EMBED_MODEL>
+  Models configured via llm_backend.py
 """
 
 import json
@@ -263,8 +262,9 @@ def main():
     jobs         = taxonomy["jobs"]
     total_target = taxonomy["total_target"]
 
-    log.info(f"LLM model   : {LLM_MODEL}")
-    log.info(f"Embed model : {EMBED_MODEL}")
+    from llm_backend import LLM_MODEL_PATH, EMBED_MODEL_PATH
+    log.info(f"LLM model   : {LLM_MODEL_PATH}")
+    log.info(f"NLP embed   : {EMBED_MODEL_PATH}")
     log.info(f"Target ideas: {total_target}")
     log.info(f"Dedup threshold: {IDEA_SIMILARITY_THRESHOLD}")
 

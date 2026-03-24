@@ -1,7 +1,7 @@
 """
 Phase 3 -- Validation and Deduplication (Ollama)
 Runs four checks on every raw snippet:
-  1. Embedding-based deduplication  (Qwen3-Embedding-8B via llama-cpp-python)
+  1. Embedding-based deduplication  (Ollama embed model)
   2. C compilation                  (gcc, with iterative LLM correction)
   3. Rust compilation               (rustc, with iterative LLM correction)
   4. Semantic equivalence judge     (Ollama LLM)
@@ -17,7 +17,7 @@ Outputs:
 
 Requirements:
   pip install llama-cpp-python numpy
-  Models: qwen3-coder-30b.gguf, Qwen3-Embedding-8B-Q4_K_M.gguf
+  Models configured via llm_backend.py
 """
 
 import json
@@ -37,7 +37,7 @@ DB_PATH          = Path("output/snippets.db")
 EMBED_DB_PATH    = Path("output/embeddings.db")
 REPORT_PATH      = Path("output/validation_report.json")
 
-# Qwen3-Embedding-8B is used for code deduplication -- threshold raised accordingly
+# Qwen3-Embedding-8B is used for code deduplication -- threshold raised
 COSINE_THRESHOLD = 0.95
 
 # How many times to ask the LLM to fix a compile error before giving up.
@@ -106,7 +106,6 @@ def get_embed_db() -> sqlite3.Connection:
 # ── Check 1: Embedding deduplication ─────────────────────────────────────────
 
 def get_embedding(text: str) -> np.ndarray:
-    """Embed source code using Qwen3-Embedding-8B for high-quality code similarity."""
     vec  = code_embed_logged(text[:4096])
     arr  = np.array(vec, dtype=np.float32)
     norm = np.linalg.norm(arr)
@@ -487,8 +486,9 @@ def validate_all(conn: sqlite3.Connection, econn: sqlite3.Connection) -> dict:
         }
 
     log.info(f"Validating {len(pending)} raw snippets")
-    log.info(f"LLM model        : {LLM_MODEL}")
-    log.info(f"Embed model      : {EMBED_MODEL}")
+    from llm_backend import LLM_MODEL_PATH, CODE_EMBED_MODEL_PATH
+    log.info(f"LLM model        : {LLM_MODEL_PATH}")
+    log.info(f"Code embed model : {CODE_EMBED_MODEL_PATH}")
     log.info(f"Max fix attempts : {MAX_FIX_ATTEMPTS} per language")
 
     existing_embeddings = load_existing_embeddings(econn)

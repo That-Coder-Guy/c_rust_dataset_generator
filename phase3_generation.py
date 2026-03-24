@@ -11,7 +11,7 @@ Outputs:
   output/generation_log.jsonl
 
 Requirements:
-  pip install llama-cpp-python json-repair
+  pip install ollama json-repair
   Models configured via llm_backend.py
 """
 
@@ -265,7 +265,8 @@ def main():
 
     from llm_backend import LLM_MODEL_PATH
     log.info(f"LLM model      : {LLM_MODEL_PATH}")
-    log.info(f"Context window : {NUM_CTX} tokens")
+    from llm_backend import N_CTX
+    log.info(f"Context window : {N_CTX} tokens")
     log.info(f"Total ideas    : {total}")
     log.info(f"Already coded  : {done}")
     log.info(f"Pending        : {len(pending)}")
